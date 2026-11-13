@@ -1,0 +1,136 @@
+version: 2
+project_name: algolia
+
+release:
+  prerelease: auto
+  name_template: "Algolia CLI {{.Version}}"
+
+before:
+  hooks:
+    - go mod tidy
+    - go generate ./...
+    - ./scripts/completions.sh
+
+builds:
+  - <<: &build_defaults
+      binary: algolia
+      main: ./cmd/algolia/main.go
+      ldflags:
+        - -s -w
+          -X github.com/algolia/cli/pkg/version.Version={{.Version}}
+          -X github.com/algolia/cli/api/dashboard.DefaultDashboardURL={{ .Env.ALGOLIA_DASHBOARD_URL }}
+          -X github.com/algolia/cli/api/dashboard.DefaultAPIURL={{ .Env.ALGOLIA_API_URL }}
+          -X github.com/algolia/cli/pkg/auth.DefaultOAuthClientID={{ .Env.ALGOLIA_OAUTH_CLIENT_ID }}
+          -X 'github.com/algolia/cli/api/dashboard.DefaultOAuthScope={{ .Env.ALGOLIA_OAUTH_SCOPE }}'
+    id: macos
+    goos: [darwin]
+    goarch: [amd64, arm64]
+
+  - <<: *build_defaults
+    id: linux
+    goos: [linux]
+    goarch: ["386", "arm", "amd64", "arm64"]
+    env:
+      - CGO_ENABLED=0
+
+  - <<: *build_defaults
+    id: windows
+    goos: [windows]
+    goarch: ["386", "amd64", "arm64"]
+
+archives:
+  - id: nix
+    builds: [macos, linux]
+    <<: &archive_defaults
+      name_template: "{{ .ProjectName }}_{{ .Version }}_{{- if eq .Os \"darwin\" }}macOS{{- else }}{{ .Os }}{{- end }}_{{ .Arch }}{{ if .Arm }}v{{ .Arm }}{{ end }}"
+    wrap_in_directory: true
+    format: tar.gz
+    files:
+      - LICENSE
+      - completions/*
+  - id: windows
+    builds: [windows]
+    <<: *archive_defaults
+    wrap_in_directory: false
+    format: zip
+    files:
+      - LICENSE
+
+nfpms:
+  - license: MIT
+    maintainer: Algolia
+    homepage: https://www.algolia.com/
+    bindir: /usr/bin
+    dependencies:
+      - git
+    description: Algolia CLI utility
+    formats:
+      - deb
+      - rpm
+
+brews:
+  - repository:
+      owner: algolia
+      name: homebrew-algolia-cli
+    commit_author:
+      name: algolia-ci
+      email: support@algolia.com
+    homepage: https://www.algolia.com
+    description: Algolia CLI utility
+    install: |
+      bin.install "algolia"
+      bash_completion.install "completions/algolia.bash" => "algolia"
+      zsh_completion.install "completions/algolia.zsh" => "_algolia"
+      fish_completion.install "completions/algolia.fish"
+    caveats: "❤ Thanks for installing the Algolia CLI!"
+
+# dockers:
+#   - goos: linux
+#     goarch: amd64
+#     ids:
+#       - algolia
+#       - algolia-linux
+#     <<: &docker_defaults
+#       image_templates:
+#         - "algolia/cli:latest"
+#         - "algolia/cli:{{ .Tag }}"
+#       build_flag_templates:
+#         - "--pull"
+#         - "--label=org.opencontainers.image.created={{.Date}}"
+#         - "--label=org.opencontainers.image.name={{.ProjectName}}"
+#         - "--label=org.opencontainers.image.revision={{.FullCommit}}"
+#         - "--label=org.opencontainers.image.version={{.Version}}"
+#         - "--label=repository=https://github.com/algolia/cli"
+#         - "--label=homepage=https://algolia.com"
+#   - goos: linux
+#     goarch: arm64
+#     ids:
+#       - algolia
+#       - algolia-linux-arm
+#     <<: *docker_defaults
+
+chocolateys:
+  -
+    name: algolia
+    title: Algolia CLI
+    authors: Algolia
+    ids:
+      - windows
+    project_url: https://algolia.com/doc/tools/cli
+    url_template: "https://github.com/algolia/cli/releases/download/{{ .Tag }}/{{ .ArtifactName }}"
+    icon_url: 'https://cdn-assets-eu.frontify.com/s3/frontify-enterprise-files-eu/eyJwYXRoIjoiYWxnb2xpYS1icmFuZFwvZmlsZVwvRGVRczRpYzJpcWRwcHNQaTQ0aVoucG5nIn0:algolia-brand:iMztVbeCSM-SuJ011FE1EigUhc-yZZ5RPPpmq6DP8T0?width=300'
+    copyright: 2023 Algolia
+    license_url: https://github.com/algolia/cli/blob/main/LICENSE
+    require_license_acceptance: false
+    project_source_url: https://github.com/algolia/cli
+    docs_url: https://algolia.com/doc/tools/cli
+    bug_tracker_url: https://github.com/algolia/cli/issues
+    tags: "algolia search cli automation interface command-line tool devtool"
+    summary: Algolia's official CLI devtool
+    description: |
+      {{ .ProjectName }} chocolatey installer package.
+      A command line interface to enable Algolia developers to interact with and configure their Algolia applications straight from a command line or terminal window. Automate common workloads, create snapshots, revert to backups, or quickly modify applications as needed! This is a lightweight tool, providing a text-only interface, that is easy to install and use!
+    release_notes: "https://github.com/algolia/cli/releases/tag/v{{ .Version }}"
+    api_key: '{{ .Env.CHOCOLATEY_API_KEY }}'
+    source_repo: "https://push.chocolatey.org/"
+    goamd64: v1

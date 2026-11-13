@@ -1,0 +1,163 @@
+package move
+
+import (
+	"fmt"
+
+	"github.com/AlecAivazis/survey/v2"
+	"github.com/MakeNowJust/heredoc"
+	"github.com/algolia/algoliasearch-client-go/v4/algolia/search"
+	"github.com/spf13/cobra"
+
+	"github.com/algolia/cli/pkg/cmdutil"
+	"github.com/algolia/cli/pkg/config"
+	"github.com/algolia/cli/pkg/iostreams"
+	"github.com/algolia/cli/pkg/prompt"
+	"github.com/algolia/cli/pkg/validators"
+)
+
+type MoveOptions struct {
+	Config config.IConfig
+	IO     *iostreams.IOStreams
+
+	SearchClient func() (*search.APIClient, error)
+
+	SourceIndex      string
+	DestinationIndex string
+
+	Wait bool
+
+	DoConfirm bool
+
+	PrintFlags *cmdutil.PrintFlags
+}
+
+// NewMoveCmd creates and returns a move command for indices
+func NewMoveCmd(f *cmdutil.Factory, runF func(*MoveOptions) error) *cobra.Command {
+	opts := &MoveOptions{
+		IO:           f.IOStreams,
+		Config:       f.Config,
+		SearchClient: f.SearchClient,
+		PrintFlags:   cmdutil.NewPrintFlags(),
+	}
+
+	var confirm bool
+
+	cmd := &cobra.Command{
+		Use:               "move <source-index> <destination-index>",
+		Args:              validators.ExactArgs(2),
+		ValidArgsFunction: cmdutil.IndexNames(opts.SearchClient),
+		Annotations: map[string]string{
+			"acls": "addObject",
+		},
+		Short: "Move an index",
+		Long: heredoc.Doc(`
+			Move the full source index (records, synonyms, rules, settings) to a destination index, effectively deleting the source.
+		`),
+		Example: heredoc.Doc(`
+			# Move the "TEST_MOVIES" index to "DEV_MOVIES"
+			$ algolia indices move TEST_MOVIES DEV_MOVIES
+		`),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			opts.SourceIndex = args[0]
+			opts.DestinationIndex = args[1]
+
+			if !confirm {
+				if !opts.IO.CanPrompt() {
+					return cmdutil.FlagErrorf(
+						"--confirm required when non-interactive shell is detected",
+					)
+				}
+				opts.DoConfirm = true
+			}
+
+			if runF != nil {
+				return runF(opts)
+			}
+
+			return runMoveCmd(opts)
+		},
+	}
+
+	cmd.Flags().BoolVarP(&confirm, "confirm", "y", false, "Skip the move index confirmation prompt")
+	cmd.Flags().BoolVarP(&opts.Wait, "wait", "w", false, "Wait for the operation to complete")
+
+	opts.PrintFlags.AddFlags(cmd)
+
+	return cmd
+}
+
+func runMoveCmd(opts *MoveOptions) error {
+	client, err := opts.SearchClient()
+	if err != nil {
+		return err
+	}
+
+	cs := opts.IO.ColorScheme()
+	message := fmt.Sprintf(
+		"Are you sure you want to move %s to %s?",
+		cs.Bold(opts.SourceIndex),
+		cs.Bold(opts.DestinationIndex),
+	)
+
+	if opts.DoConfirm {
+		var confirmed bool
+		p := &survey.Confirm{
+			Message: message,
+			Default: false,
+		}
+		err = prompt.SurveyAskOne(p, &confirmed)
+		if err != nil {
+			return fmt.Errorf("failed to prompt: %w", err)
+		}
+		if !confirmed {
+			return nil
+		}
+	}
+
+	opts.IO.StartProgressIndicatorWithLabel(
+		fmt.Sprintf("Moving %s to %s", cs.Bold(opts.SourceIndex), cs.Bold(opts.DestinationIndex)),
+	)
+	res, err := client.OperationIndex(
+		client.NewApiOperationIndexRequest(
+			opts.SourceIndex,
+			search.NewEmptyOperationIndexParams().
+				SetDestination(opts.DestinationIndex).
+				SetOperation(search.OPERATION_TYPE_MOVE),
+		),
+	)
+	if err != nil {
+		opts.IO.StopProgressIndicator()
+		return err
+	}
+
+	if opts.Wait {
+		opts.IO.UpdateProgressIndicatorLabel("Waiting for the task to complete")
+		_, err := client.WaitForTask(opts.DestinationIndex, res.TaskID)
+		if err != nil {
+			opts.IO.StopProgressIndicator()
+			return err
+		}
+	}
+
+	opts.IO.StopProgressIndicator()
+
+	if opts.PrintFlags.OutputFlagSpecified() && opts.PrintFlags.OutputFormat != nil {
+		p, err := opts.PrintFlags.ToPrinter()
+		if err != nil {
+			return err
+		}
+		return p.Print(opts.IO, res)
+	}
+
+	if opts.IO.IsStdoutTTY() {
+		fmt.Fprintf(
+			opts.IO.Out,
+			"%s Moved %s to %s\n",
+			cs.SuccessIcon(),
+			cs.Bold(opts.SourceIndex),
+			cs.Bold(opts.DestinationIndex),
+		)
+	}
+
+	return nil
+}

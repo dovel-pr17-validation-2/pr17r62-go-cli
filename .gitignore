@@ -1,0 +1,24 @@
+/bin
+/dist
+
+# VS Code
+.vscode
+
+# IntelliJ
+.idea
+
+# macOS
+.DS_Store
+
+# vim
+*.swp
+
+vendor/
+
+# local build
+/algolia
+
+.gocache/
+
+# Environment variables
+*.env

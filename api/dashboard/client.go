@@ -1,0 +1,741 @@
+package dashboard
+
+import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"os"
+	"strings"
+)
+
+// Production defaults; overridable via ldflags or ALGOLIA_DASHBOARD_URL / ALGOLIA_API_URL / ALGOLIA_OAUTH_SCOPE env vars.
+var (
+	DefaultDashboardURL = "https://dashboard.algolia.com"
+	DefaultAPIURL       = "https://api.dashboard.algolia.com"
+	DefaultOAuthScope   = "public applications:manage keys:manage"
+)
+
+// Client interacts with the Algolia Dashboard OAuth endpoint and the Public API.
+type Client struct {
+	DashboardURL string
+	APIURL       string
+	OAuthScope   string
+	ClientID     string
+	client       *http.Client
+}
+
+// NewClient creates a new dashboard client with the given OAuth client ID.
+// Respects ALGOLIA_DASHBOARD_URL, ALGOLIA_API_URL, and ALGOLIA_OAUTH_SCOPE
+// environment variables, falling back to the compiled-in defaults (set via ldflags).
+func NewClient(clientID string) *Client {
+	dashboardURL := DefaultDashboardURL
+	if v := os.Getenv("ALGOLIA_DASHBOARD_URL"); v != "" {
+		dashboardURL = strings.TrimRight(v, "/")
+	}
+	if dashboardURL == "" {
+		fmt.Fprintln(
+			os.Stderr,
+			"fatal: ALGOLIA_DASHBOARD_URL is not set and no default was compiled in",
+		)
+		os.Exit(1)
+	}
+
+	apiURL := DefaultAPIURL
+	if v := os.Getenv("ALGOLIA_API_URL"); v != "" {
+		apiURL = strings.TrimRight(v, "/")
+	}
+	if apiURL == "" {
+		fmt.Fprintln(os.Stderr, "fatal: ALGOLIA_API_URL is not set and no default was compiled in")
+		os.Exit(1)
+	}
+
+	oauthScope := DefaultOAuthScope
+	if v := os.Getenv("ALGOLIA_OAUTH_SCOPE"); v != "" {
+		oauthScope = v
+	}
+	if oauthScope == "" {
+		fmt.Fprintln(
+			os.Stderr,
+			"fatal: ALGOLIA_OAUTH_SCOPE is not set and no default was compiled in",
+		)
+		os.Exit(1)
+	}
+
+	return &Client{
+		DashboardURL: dashboardURL,
+		APIURL:       apiURL,
+		OAuthScope:   oauthScope,
+		ClientID:     clientID,
+		client:       http.DefaultClient,
+	}
+}
+
+// NewClientWithHTTPClient creates a new dashboard client with a custom HTTP client.
+// Used primarily in tests; callers must set DashboardURL and APIURL explicitly.
+func NewClientWithHTTPClient(clientID string, httpClient *http.Client) *Client {
+	return &Client{
+		ClientID: clientID,
+		client:   httpClient,
+	}
+}
+
+// AuthorizeURL builds the OAuth 2.0 authorization URL for the browser-based sign-in flow.
+func (c *Client) AuthorizeURL(codeChallenge, redirectURI string) string {
+	return c.buildAuthorizeURL(codeChallenge, redirectURI, nil)
+}
+
+// SignupAuthorizeURL builds an OAuth 2.0 authorization URL that opens the
+// sign-up page instead of the default sign-in page.
+func (c *Client) SignupAuthorizeURL(codeChallenge, redirectURI string) string {
+	return c.buildAuthorizeURL(codeChallenge, redirectURI, map[string]string{"screen": "signup"})
+}
+
+func (c *Client) buildAuthorizeURL(
+	codeChallenge, redirectURI string,
+	extra map[string]string,
+) string {
+	params := url.Values{
+		"client_id":             {c.ClientID},
+		"response_type":         {"code"},
+		"code_challenge":        {codeChallenge},
+		"code_challenge_method": {"S256"},
+		"scope":                 {c.OAuthScope},
+		"redirect_uri":          {redirectURI},
+	}
+	for k, v := range extra {
+		params.Set(k, v)
+	}
+	return c.DashboardURL + "/2/oauth/authorize?" + params.Encode()
+}
+
+// AuthorizationCodeGrant exchanges an authorization code + PKCE code_verifier
+// for an access token. The redirectURI must match the one used in the authorize URL.
+func (c *Client) AuthorizationCodeGrant(
+	code, codeVerifier, redirectURI string,
+) (*OAuthTokenResponse, error) {
+	form := url.Values{
+		"grant_type":    {"authorization_code"},
+		"client_id":     {c.ClientID},
+		"code":          {code},
+		"code_verifier": {codeVerifier},
+		"redirect_uri":  {redirectURI},
+	}
+
+	req, err := http.NewRequest(
+		http.MethodPost,
+		c.DashboardURL+"/2/oauth/token",
+		strings.NewReader(form.Encode()),
+	)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("token request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, parseOAuthError(resp, "authorization code exchange")
+	}
+
+	var tokenResp OAuthTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		return nil, fmt.Errorf("failed to parse token response: %w", err)
+	}
+
+	return &tokenResp, nil
+}
+
+// RefreshToken uses a refresh token to obtain a new access token.
+func (c *Client) RefreshToken(refreshToken string) (*OAuthTokenResponse, error) {
+	form := url.Values{
+		"grant_type":    {"refresh_token"},
+		"client_id":     {c.ClientID},
+		"refresh_token": {refreshToken},
+	}
+
+	req, err := http.NewRequest(
+		http.MethodPost,
+		c.DashboardURL+"/2/oauth/token",
+		strings.NewReader(form.Encode()),
+	)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("token refresh request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, parseOAuthError(resp, "token refresh")
+	}
+
+	var tokenResp OAuthTokenResponse
+	if err := json.NewDecoder(resp.Body).Decode(&tokenResp); err != nil {
+		return nil, fmt.Errorf("failed to parse refresh token response: %w", err)
+	}
+
+	return &tokenResp, nil
+}
+
+// RevokeToken revokes an OAuth access or refresh token via POST /2/oauth/revoke.
+func (c *Client) RevokeToken(token string) error {
+	form := url.Values{
+		"client_id": {c.ClientID},
+		"token":     {token},
+	}
+
+	req, err := http.NewRequest(
+		http.MethodPost,
+		c.DashboardURL+"/2/oauth/revoke",
+		strings.NewReader(form.Encode()),
+	)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return fmt.Errorf("token revocation request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return parseOAuthError(resp, "token revocation")
+	}
+
+	return nil
+}
+
+// ListApplications returns all applications for the authenticated user,
+// following pagination to fetch every page.
+func (c *Client) ListApplications(accessToken string) ([]Application, error) {
+	var allApps []Application
+	page := 1
+
+	for {
+		endpoint := fmt.Sprintf("%s/1/applications?page=%d", c.APIURL, page)
+		req, err := http.NewRequest(http.MethodGet, endpoint, nil)
+		if err != nil {
+			return nil, err
+		}
+		c.setAPIHeaders(req, accessToken)
+
+		resp, err := c.client.Do(req)
+		if err != nil {
+			return nil, fmt.Errorf("list applications request failed: %w", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode == http.StatusUnauthorized {
+			return nil, ErrSessionExpired
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			return nil, fmt.Errorf("list applications failed with status: %d", resp.StatusCode)
+		}
+
+		var appsResp ApplicationsResponse
+		if err := json.NewDecoder(resp.Body).Decode(&appsResp); err != nil {
+			return nil, fmt.Errorf("failed to parse applications response: %w", err)
+		}
+
+		for i := range appsResp.Data {
+			allApps = append(allApps, appsResp.Data[i].toApplication())
+		}
+
+		if appsResp.Meta.CurrentPage >= appsResp.Meta.TotalPages {
+			break
+		}
+		page++
+	}
+
+	return allApps, nil
+}
+
+// GetApplication returns a single application by its ID.
+func (c *Client) GetApplication(accessToken, appID string) (*Application, error) {
+	req, err := http.NewRequest(
+		http.MethodGet,
+		c.APIURL+"/1/application/"+url.PathEscape(appID),
+		nil,
+	)
+	if err != nil {
+		return nil, err
+	}
+	c.setAPIHeaders(req, accessToken)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("get application request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrSessionExpired
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("get application failed with status: %d", resp.StatusCode)
+	}
+
+	var singleResp SingleApplicationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&singleResp); err != nil {
+		return nil, fmt.Errorf("failed to parse application response: %w", err)
+	}
+
+	app := singleResp.Data.toApplication()
+	return &app, nil
+}
+
+// CreateApplication creates a new application for the authenticated user.
+func (c *Client) CreateApplication(accessToken, region, name string) (*Application, error) {
+	payload := CreateApplicationRequest{RegionCode: region, Name: name}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	req, err := http.NewRequest(http.MethodPost, c.APIURL+"/1/applications", bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	c.setAPIHeaders(req, accessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("create application request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		respBody, _ := io.ReadAll(resp.Body)
+		respStr := string(respBody)
+
+		if strings.Contains(strings.ToLower(respStr), "cluster") &&
+			strings.Contains(strings.ToLower(respStr), "not available") ||
+			strings.Contains(strings.ToLower(respStr), "no cluster") {
+			return nil, &ErrClusterUnavailable{
+				Region:  region,
+				Message: fmt.Sprintf("no cluster available in region %q", region),
+			}
+		}
+
+		return nil, fmt.Errorf(
+			"create application failed with status %d: %s",
+			resp.StatusCode,
+			respStr,
+		)
+	}
+
+	var singleResp SingleApplicationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&singleResp); err != nil {
+		return nil, fmt.Errorf("failed to parse application response: %w", err)
+	}
+
+	app := singleResp.Data.toApplication()
+	return &app, nil
+}
+
+// UpdateApplication renames an existing application.
+func (c *Client) UpdateApplication(accessToken, appID, name string) (*Application, error) {
+	payload := UpdateApplicationRequest{Name: name}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	endpoint := c.APIURL + "/1/applications/" + url.PathEscape(appID)
+	req, err := http.NewRequest(http.MethodPatch, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	c.setAPIHeaders(req, accessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("update application request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrSessionExpired
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		respBody, _ := io.ReadAll(resp.Body)
+		if resp.StatusCode == http.StatusNotFound {
+			return nil, fmt.Errorf(
+				"no existing application found; select one using 'algolia application select' or create a new one with 'algolia application create'",
+			)
+		}
+		return nil, fmt.Errorf(
+			"update application failed with status %d: %s",
+			resp.StatusCode,
+			string(respBody),
+		)
+	}
+
+	var singleResp SingleApplicationResponse
+	if err := json.NewDecoder(resp.Body).Decode(&singleResp); err != nil {
+		return nil, fmt.Errorf("failed to parse application response: %w", err)
+	}
+
+	app := singleResp.Data.toApplication()
+	return &app, nil
+}
+
+// GetSelfServePlans returns the available plans
+func (c *Client) GetSelfServePlans(accessToken string) ([]Plan, error) {
+	req, err := http.NewRequest(http.MethodGet, c.APIURL+"/1/plan-templates/self-serve", nil)
+	if err != nil {
+		return nil, err
+	}
+	c.setAPIHeaders(req, accessToken)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("Couldn't get the list of plans: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrSessionExpired
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Couldn't get the list of plans: %d", resp.StatusCode)
+	}
+
+	var plansResp PlanTemplatesResponse
+	if err := json.NewDecoder(resp.Body).Decode(&plansResp); err != nil {
+		return nil, fmt.Errorf("Couldn't get the list of plans: %w", err)
+	}
+
+	plans := make([]Plan, 0, len(plansResp.Data))
+	for i := range plansResp.Data {
+		plans = append(plans, plansResp.Data[i].toPlan())
+	}
+	return plans, nil
+}
+
+// GetUser returns account-level information for the authenticated user
+func (c *Client) GetUser(accessToken string) (*DashboardUser, error) {
+	req, err := http.NewRequest(http.MethodGet, c.APIURL+"/1/user", nil)
+	if err != nil {
+		return nil, err
+	}
+	c.setAPIHeaders(req, accessToken)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("Couldn't get your account details: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrSessionExpired
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("Couldn't get your account details: %d", resp.StatusCode)
+	}
+
+	var userResp userResponse
+	if err := json.NewDecoder(resp.Body).Decode(&userResp); err != nil {
+		return nil, fmt.Errorf("Couldn't get your account details: %w", err)
+	}
+
+	user := userResp.toUser()
+	return &user, nil
+}
+
+// ChangeApplicationPlan changes the plan of an application
+func (c *Client) ChangeApplicationPlan(accessToken, appID, plan string) (*Application, error) {
+	payload := ChangePlanRequest{Plan: plan}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, err
+	}
+
+	endpoint := fmt.Sprintf(
+		"%s/1/applications/%s/plan/self-serve",
+		c.APIURL,
+		url.PathEscape(appID),
+	)
+	req, err := http.NewRequest(http.MethodPatch, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	c.setAPIHeaders(req, accessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("Couldn't change your application's plan: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, ErrSessionExpired
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("Couldn't change your application's plan: %d", resp.StatusCode)
+	}
+
+	respBody, _ := io.ReadAll(resp.Body)
+	var singleResp SingleApplicationResponse
+	if err := json.Unmarshal(respBody, &singleResp); err == nil &&
+		singleResp.Data.Attributes.ApplicationID != "" {
+		app := singleResp.Data.toApplication()
+		return &app, nil
+	}
+	return &Application{ID: appID}, nil
+}
+
+// ListRegions returns the allowed hosting regions for application creation.
+func (c *Client) ListRegions(accessToken string) ([]Region, error) {
+	req, err := http.NewRequest(http.MethodGet, c.APIURL+"/1/hosting/regions", nil)
+	if err != nil {
+		return nil, err
+	}
+	c.setAPIHeaders(req, accessToken)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("list regions request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("list regions failed with status: %d", resp.StatusCode)
+	}
+
+	var regionsResp RegionsResponse
+	if err := json.NewDecoder(resp.Body).Decode(&regionsResp); err != nil {
+		return nil, fmt.Errorf("failed to parse regions response: %w", err)
+	}
+
+	return regionsResp.RegionCodes, nil
+}
+
+// WriteACL is the set of permissions for API keys created by the CLI.
+var WriteACL = []string{
+	"search", "browse", "seeUnretrievableAttributes", "listIndexes",
+	"analytics", "logs", "addObject", "deleteObject", "deleteIndex",
+	"settings", "editSettings", "recommendation",
+}
+
+// CreateAPIKey creates a new API key with the given ACL for the specified application.
+func (c *Client) CreateAPIKey(
+	accessToken, appID string,
+	acl []string,
+	description string,
+) (CreatedAPIKey, error) {
+	key, err := c.CreateAPIKeyWithParams(
+		accessToken,
+		appID,
+		CreateAPIKeyRequest{ACL: acl, Description: description},
+	)
+	if err != nil {
+		return CreatedAPIKey{}, err
+	}
+
+	return CreatedAPIKey{Value: key.Value, UUID: key.UUID}, nil
+}
+
+func (c *Client) CreateAPIKeyWithParams(
+	accessToken, appID string,
+	params CreateAPIKeyRequest,
+) (APIKey, error) {
+	body, err := json.Marshal(params)
+	if err != nil {
+		return APIKey{}, err
+	}
+
+	endpoint := fmt.Sprintf("%s/1/applications/%s/api-keys", c.APIURL, url.PathEscape(appID))
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return APIKey{}, err
+	}
+	c.setAPIHeaders(req, accessToken)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return APIKey{}, fmt.Errorf("create API key request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return APIKey{}, ErrSessionExpired
+	}
+	if resp.StatusCode == http.StatusNotFound {
+		return APIKey{}, ErrApplicationNotFound
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return APIKey{}, fmt.Errorf("failed to read API key response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return APIKey{}, fmt.Errorf(
+			"create API key failed with status %d: %s",
+			resp.StatusCode,
+			string(respBody),
+		)
+	}
+
+	var keyResp CreateAPIKeyResponse
+	if err := json.Unmarshal(respBody, &keyResp); err != nil {
+		return APIKey{}, fmt.Errorf(
+			"failed to parse API key response: %w (body: %s)",
+			err,
+			string(respBody),
+		)
+	}
+
+	if keyResp.Data.Attributes.Value == "" {
+		return APIKey{}, fmt.Errorf(
+			"API key creation succeeded but no key was returned in the response: %s",
+			string(respBody),
+		)
+	}
+
+	return keyResp.Data.toAPIKey(), nil
+}
+
+// RotateAPIKey regenerates the secret value of the API key identified by keyUUID
+// for the given application, via the Public API. The key keeps its UUID; only
+// its value changes. Returns the new value and the (unchanged) UUID.
+func (c *Client) RotateAPIKey(accessToken, appID, keyUUID string) (CreatedAPIKey, error) {
+	endpoint := fmt.Sprintf(
+		"%s/1/applications/%s/api-keys/%s/rotate",
+		c.APIURL,
+		url.PathEscape(appID),
+		url.PathEscape(keyUUID),
+	)
+	req, err := http.NewRequest(http.MethodPost, endpoint, nil)
+	if err != nil {
+		return CreatedAPIKey{}, err
+	}
+	c.setAPIHeaders(req, accessToken)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return CreatedAPIKey{}, fmt.Errorf("rotate API key request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return CreatedAPIKey{}, ErrSessionExpired
+	}
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return CreatedAPIKey{}, fmt.Errorf("failed to read API key response: %w", err)
+	}
+
+	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusCreated {
+		return CreatedAPIKey{}, fmt.Errorf(
+			"rotate API key failed with status %d: %s",
+			resp.StatusCode,
+			string(respBody),
+		)
+	}
+
+	var keyResp CreateAPIKeyResponse
+	if err := json.Unmarshal(respBody, &keyResp); err != nil {
+		return CreatedAPIKey{}, fmt.Errorf(
+			"failed to parse API key response: %w (body: %s)",
+			err,
+			string(respBody),
+		)
+	}
+
+	key := keyResp.Data.Attributes.Value
+	if key == "" {
+		return CreatedAPIKey{}, fmt.Errorf(
+			"API key rotation succeeded but no key was returned in the response: %s",
+			string(respBody),
+		)
+	}
+
+	return CreatedAPIKey{Value: key, UUID: keyResp.Data.ID}, nil
+}
+
+// GetCrawlerUser gets the crawler API user data for the current authenticated user
+func (c *Client) GetCrawlerUser(accessToken string) (*DashboardCrawlerUserData, error) {
+	req, err := http.NewRequest(http.MethodGet, c.APIURL+"/1/crawler/user", nil)
+	if err != nil {
+		return nil, err
+	}
+
+	c.setAPIHeaders(req, accessToken)
+
+	resp, err := c.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		var errResp DashboardCrawlerErrorResponse
+		if err := json.NewDecoder(resp.Body).Decode(&errResp); err != nil {
+			return nil, fmt.Errorf("failed to parse crawler response: %w", err)
+		}
+
+		if len(errResp.Errors) == 0 {
+			return nil, fmt.Errorf("failed to get crawler user data: unknown crawler error")
+		}
+
+		crawlerError := errResp.Errors[0]
+
+		message := crawlerError.Title
+		if crawlerError.Detail != nil && *crawlerError.Detail != "" {
+			message = *crawlerError.Detail
+		}
+
+		return nil, fmt.Errorf("failed to get crawler user data: %s", message)
+	}
+
+	var userResp DashboardCrawlerUserResponse
+	if err := json.NewDecoder(resp.Body).Decode(&userResp); err != nil {
+		return nil, fmt.Errorf("failed to parse crawler response: %w", err)
+	}
+
+	return &userResp.Data, nil
+}
+
+func (c *Client) setAPIHeaders(req *http.Request, accessToken string) {
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+	req.Header.Set("Accept", "application/vnd.api+json")
+}
+
+func parseOAuthError(resp *http.Response, context string) error {
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("%s failed with status %d", context, resp.StatusCode)
+	}
+
+	var oauthErr OAuthErrorResponse
+	if json.Unmarshal(body, &oauthErr) == nil && oauthErr.ErrorDescription != "" {
+		return fmt.Errorf("%s: %s", context, oauthErr.ErrorDescription)
+	}
+
+	return fmt.Errorf("%s failed with status %d: %s", context, resp.StatusCode, string(body))
+}

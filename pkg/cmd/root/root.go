@@ -1,0 +1,438 @@
+//go:generate go run ../../gen/gen_flags.go
+
+package root
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/AlecAivazis/survey/v2/terminal"
+	"github.com/MakeNowJust/heredoc"
+	"github.com/cli/safeexec"
+	"github.com/spf13/cobra"
+
+	"github.com/algolia/cli/internal/update"
+	"github.com/algolia/cli/pkg/auth"
+	"github.com/algolia/cli/pkg/cmd/agentstudio"
+	"github.com/algolia/cli/pkg/cmd/apikeys"
+	"github.com/algolia/cli/pkg/cmd/application"
+	authcmd "github.com/algolia/cli/pkg/cmd/auth"
+	"github.com/algolia/cli/pkg/cmd/compositions"
+	"github.com/algolia/cli/pkg/cmd/crawler"
+	"github.com/algolia/cli/pkg/cmd/describe"
+	"github.com/algolia/cli/pkg/cmd/dictionary"
+	"github.com/algolia/cli/pkg/cmd/events"
+	"github.com/algolia/cli/pkg/cmd/factory"
+	"github.com/algolia/cli/pkg/cmd/indices"
+	"github.com/algolia/cli/pkg/cmd/objects"
+	"github.com/algolia/cli/pkg/cmd/open"
+	"github.com/algolia/cli/pkg/cmd/profile"
+	"github.com/algolia/cli/pkg/cmd/rules"
+	"github.com/algolia/cli/pkg/cmd/search"
+	"github.com/algolia/cli/pkg/cmd/settings"
+	"github.com/algolia/cli/pkg/cmd/synonyms"
+	"github.com/algolia/cli/pkg/cmdutil"
+	"github.com/algolia/cli/pkg/config"
+	"github.com/algolia/cli/pkg/telemetry"
+	"github.com/algolia/cli/pkg/utils"
+	"github.com/algolia/cli/pkg/version"
+)
+
+type exitCode int
+
+const (
+	exitOK     exitCode = 0
+	exitError  exitCode = 1
+	exitCancel exitCode = 2
+	exitAuth   exitCode = 4
+)
+
+func NewRootCmd(f *cmdutil.Factory) *cobra.Command {
+	cmd := &cobra.Command{
+		Use:     "algolia <command> <subcommand> [flags]",
+		Version: version.Version,
+		Short:   "Algolia CLI",
+		Long:    "The official command-line tool to interact with Algolia.",
+
+		SilenceUsage:  true,
+		SilenceErrors: true,
+		Example: heredoc.Doc(`
+			$ algolia auth login
+			$ algolia search MOVIES --query "toy story"
+			$ algolia objects browse MOVIES
+			$ algolia apikeys create --acl search
+			$ algolia rules import MOVIES -f rules.json
+		`),
+	}
+
+	cmd.SetOut(f.IOStreams.Out)
+	cmd.SetErr(f.IOStreams.ErrOut)
+
+	cmd.SetVersionTemplate(version.Template)
+	cmd.SetUsageFunc(rootUsageFunc(f.IOStreams, cmd))
+	cmd.SetHelpFunc(func(cmd *cobra.Command, args []string) {
+		rootHelpFunc(f, cmd, args)
+	})
+	cmd.SetFlagErrorFunc(rootFlagErrorFunc)
+
+	cmd.PersistentFlags().
+		StringVarP(&f.Config.Profile().Name, "profile", "p", "", "The profile to use")
+	// Deprecated but kept visible in help (MarkDeprecated would also hide it).
+	cmd.PersistentFlags().
+		Lookup("profile").
+		Deprecated = "use --application-id or 'algolia application select' instead"
+	_ = cmd.RegisterFlagCompletionFunc("profile", cmdutil.ConfiguredProfilesCompletionFunc(f))
+
+	cmd.PersistentFlags().
+		StringVarP(&f.Config.Profile().ApplicationID, "application-id", "", "", "The application ID (defaults to the current application, set with 'algolia application select')")
+	cmd.PersistentFlags().
+		StringVarP(&f.Config.Profile().APIKey, "api-key", "", "", "The API key (defaults to the key stored for the current application)")
+	cmd.PersistentFlags().
+		StringVarP(&f.Config.Profile().AdminAPIKey, "admin-api-key", "", "", "The admin API key")
+	_ = cmd.PersistentFlags().MarkDeprecated("admin-api-key", "use --api-key instead")
+	cmd.PersistentFlags().
+		StringSliceVar(&f.Config.Profile().SearchHosts, "search-hosts", nil, "The list of search hosts as CSV")
+
+	cmd.Flags().BoolP("version", "v", false, "Get the version of the Algolia CLI")
+
+	// CLI related commands
+	cmd.AddCommand(authcmd.NewAuthCmd(f))
+	cmd.AddCommand(profile.NewProfileCmd(f))
+	cmd.AddCommand(describe.NewDescribeCmd(f))
+
+	// Convenience commands
+	cmd.AddCommand(open.NewOpenCmd(f))
+
+	// API related commands
+	cmd.AddCommand(application.NewApplicationCmd(f))
+	cmd.AddCommand(search.NewSearchCmd(f))
+	cmd.AddCommand(indices.NewIndicesCmd(f))
+	cmd.AddCommand(objects.NewObjectsCmd(f))
+	cmd.AddCommand(apikeys.NewAPIKeysCmd(f))
+	cmd.AddCommand(settings.NewSettingsCmd(f))
+	cmd.AddCommand(rules.NewRulesCmd(f))
+	cmd.AddCommand(synonyms.NewSynonymsCmd(f))
+	cmd.AddCommand(dictionary.NewDictionaryCmd(f))
+	cmd.AddCommand(events.NewEventsCmd(f))
+	cmd.AddCommand(crawler.NewCrawlersCmd(f))
+	cmd.AddCommand(compositions.NewCompositionsCmd(f))
+	cmd.AddCommand(agentstudio.NewAgentStudioCmd(f))
+
+	return cmd
+}
+
+func Execute() (code exitCode) {
+	start := time.Now()
+	hasDebug := os.Getenv("DEBUG") != ""
+	hasTelemetry := os.Getenv("ALGOLIA_CLI_TELEMETRY") != "0"
+
+	// Set up the command factory.
+	cfg := config.Config{}
+	cfg.InitConfig()
+	cmdFactory := factory.New(version.Version, &cfg)
+	stderr := cmdFactory.IOStreams.ErrOut
+
+	// One-time config.toml → state.toml + keychain migration (GROUT-363). Must
+	// run before credential resolution, which caches state.toml per command.
+	if cfg.ShouldMigrate() {
+		if err := cfg.Migrate(); err != nil && hasDebug {
+			fmt.Fprintf(stderr, "config migration failed (will retry on next run): %s\n", err)
+		}
+	}
+
+	// Set up the update notifier.
+	updateMessageChan := make(chan *update.ReleaseInfo)
+	go func() {
+		rel, err := checkForUpdate(&cfg, version.Version)
+		if err != nil && hasDebug {
+			fmt.Fprintf(stderr, "Error checking for update: %s\n", err)
+		}
+		updateMessageChan <- rel
+	}()
+
+	// Set up the root command.
+	rootCmd := NewRootCmd(cmdFactory)
+
+	// Pre-command auth check and telemetry setup.
+	authError := errors.New("authError")
+	var preRunAccessToken string
+	rootCmd.PersistentPreRunE = func(cmd *cobra.Command, args []string) error {
+		if auth.IsAuthCheckEnabled(cmd) {
+			if err := auth.CheckAuth(&cfg); err != nil {
+				fmt.Fprintf(stderr, "Authentication error: %s\n", err)
+				if hint := auth.Remediation(err); hint != "" {
+					fmt.Fprintln(stderr, hint)
+				}
+				return authError
+			}
+
+			if err := auth.CheckACLs(cmd, cmdFactory); err != nil {
+				fmt.Fprint(stderr, err)
+				return authError
+			}
+		}
+
+		if !cmdutil.ShouldTrackUsage(cmd) {
+			return nil
+		}
+
+		// Initialize telemetry context.
+		appID, err := cfg.Profile().GetApplicationID()
+		if err != nil {
+			appID = ""
+		}
+		telemetryMetadata := telemetry.GetEventMetadata(cmd.Context())
+		telemetryMetadata.SetCobraCommandContext(cmd)
+		telemetryMetadata.SetAppID(appID)
+		telemetryMetadata.SetConfiguredApplicationsNb(len(cfg.ConfiguredProfiles()))
+
+		if token := auth.LoadToken(); token != nil {
+			telemetryMetadata.SetUser(token.UserID, token.Email, token.Name)
+			preRunAccessToken = token.AccessToken
+		}
+
+		ctx := cmd.Context()
+		telemetryClient := telemetry.GetTelemetryClient(ctx)
+
+		// Send telemetry.
+		err = telemetryClient.Track(ctx, telemetry.EventCommandInvoked, nil)
+		if err != nil && hasDebug {
+			fmt.Fprintf(stderr, "Error tracking telemetry: %s\n", err)
+		}
+
+		return nil
+	}
+
+	// Command context is used to pass information to the telemetry client.
+	ctx := createContext(rootCmd, stderr, hasDebug, hasTelemetry)
+	defer closeTelemetry(ctx)
+
+	// Report how the command ended just before the final flush (deferred
+	// functions run last-in-first-out).
+	var executedCmd *cobra.Command
+	var executeErr error
+	var elapsed time.Duration
+	defer func() {
+		trackCommandCompleted(ctx, executedCmd, code, executeErr, elapsed)
+	}()
+
+	// Run the command. The duration is measured right away so it never
+	// includes the update-notifier wait below.
+	cmd, err := rootCmd.ExecuteContextC(ctx)
+	executedCmd, executeErr, elapsed = cmd, err, time.Since(start)
+	identifyNewSession(ctx, cmd, preRunAccessToken)
+	// Handle eventual errors.
+	if err != nil {
+		if err == cmdutil.ErrSilent {
+			return exitError
+		} else if cmdutil.IsUserCancellation(err) {
+			if errors.Is(err, terminal.InterruptErr) {
+				// ensure the next shell prompt will start on its own line
+				fmt.Fprint(stderr, "\n")
+			}
+			return exitCancel
+		} else if errors.Is(err, authError) {
+			return exitAuth
+		}
+
+		printError(stderr, err, cmd, hasDebug)
+		return exitError
+	}
+
+	// If there is an update available, notify the user.
+	newRelease := <-updateMessageChan
+	if newRelease != nil {
+		cs := cmdFactory.IOStreams.ColorScheme()
+		isHomebrew := isUnderHomebrew(cmdFactory.Executable())
+		fmt.Fprintf(stderr, "\n\n%s %s → %s\n",
+			cs.Yellow("A new release of the Algolia CLI is available:"),
+			cs.Cyan(strings.TrimPrefix(version.Version, "v")),
+			cs.Cyan(strings.TrimPrefix(newRelease.Version, "v")))
+		if isHomebrew {
+			fmt.Fprintf(stderr, "To upgrade, run: %s\n", "brew update && brew upgrade algolia")
+		}
+		fmt.Fprintf(stderr, "%s\n\n",
+			cs.Yellow(newRelease.URL))
+	}
+
+	return exitOK
+}
+
+// identifyNewSession sends an Identify when the run established or renewed the
+// session: the stored access token differs from the one known at
+// PersistentPreRunE (login, signup, account switch, re-authentication or silent
+// token refresh), so the identity and its traits do not have to wait for the
+// next invocation. Runs before the deferred Command Completed so that event
+// carries the user too.
+func identifyNewSession(ctx context.Context, cmd *cobra.Command, preRunAccessToken string) {
+	if cmd == nil || !cmdutil.ShouldTrackUsage(cmd) {
+		return
+	}
+	// Same gating as trackCommandCompleted: an empty command path means
+	// PersistentPreRunE never ran, so no login could have happened either.
+	metadata := telemetry.GetEventMetadata(ctx)
+	if metadata == nil || metadata.CommandPath == "" {
+		return
+	}
+	token := auth.LoadToken()
+	if token == nil || token.UserID == "" || token.AccessToken == preRunAccessToken {
+		return
+	}
+	metadata.SetUser(token.UserID, token.Email, token.Name)
+	client := telemetry.GetTelemetryClient(ctx)
+	if client == nil {
+		return
+	}
+	_ = client.Identify(ctx)
+}
+
+// trackCommandCompleted reports how the command ended: success, failure (with
+// the class of the error) or user cancellation.
+func trackCommandCompleted(
+	ctx context.Context,
+	cmd *cobra.Command,
+	code exitCode,
+	err error,
+	elapsed time.Duration,
+) {
+	if cmd == nil || !cmdutil.ShouldTrackUsage(cmd) {
+		return
+	}
+	// An empty command path means PersistentPreRunE never ran (--help,
+	// --version, unknown flag or command, failed auth check): no Command
+	// Invoked was sent, so don't send an orphan Command Completed either.
+	metadata := telemetry.GetEventMetadata(ctx)
+	if metadata == nil || metadata.CommandPath == "" {
+		return
+	}
+	client := telemetry.GetTelemetryClient(ctx)
+	if client == nil {
+		return
+	}
+
+	props := map[string]any{
+		"succeeded":   code == exitOK,
+		"exit_code":   int(code),
+		"duration_ms": elapsed.Milliseconds(),
+	}
+	if err != nil {
+		props["error_class"] = telemetry.ErrorClass(err)
+		props["user_cancelled"] = cmdutil.IsUserCancellation(err)
+	}
+
+	_ = client.Track(ctx, telemetry.EventCommandCompleted, props)
+}
+
+// closeTelemetry flushes the pending telemetry events, giving up after a
+// short timeout so an unreachable telemetry endpoint never delays exit.
+func closeTelemetry(ctx context.Context) {
+	client := telemetry.GetTelemetryClient(ctx)
+	if client == nil {
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		client.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(500 * time.Millisecond):
+	}
+}
+
+// createContext creates a context with telemetry.
+func createContext(
+	cmd *cobra.Command,
+	stderr io.Writer,
+	hasDebug bool,
+	hasTelemetry bool,
+) context.Context {
+	ctx := context.Background()
+	telemetryMetadata := telemetry.NewEventMetadata()
+	updatedCtx := telemetry.WithEventMetadata(ctx, telemetryMetadata)
+
+	var telemetryClient telemetry.TelemetryClient = &telemetry.NoOpTelemetryClient{}
+	if hasTelemetry {
+		client, err := telemetry.NewAnalyticsTelemetryClient(hasDebug)
+		if err != nil {
+			// Fail silently (fall back to no-op telemetry) unless in debug mode.
+			if hasDebug {
+				fmt.Fprintf(stderr, "Error creating telemetry client: %s\n", err)
+			}
+		} else {
+			telemetryClient = client
+		}
+	}
+	contextWithTelemetry := telemetry.WithTelemetryClient(updatedCtx, telemetryClient)
+	return contextWithTelemetry
+}
+
+// printError prints an error to the stderr, with additional information if applicable.
+func printError(out io.Writer, err error, cmd *cobra.Command, debug bool) {
+	var dnsError *net.DNSError
+	if errors.As(err, &dnsError) {
+		fmt.Fprintf(out, "error connecting to %s\n", dnsError.Name)
+		if debug {
+			fmt.Fprintln(out, dnsError)
+		}
+		fmt.Fprintln(out, "check your internet connection or https://status.algolia.com")
+		return
+	}
+
+	fmt.Fprintln(out, err)
+
+	var flagError *cmdutil.FlagError
+	if errors.As(err, &flagError) || strings.HasPrefix(err.Error(), "unknown command ") {
+		if !strings.HasSuffix(err.Error(), "\n") {
+			fmt.Fprintln(out)
+		}
+		fmt.Fprintln(out, cmd.UsageString())
+	}
+}
+
+func shouldCheckForUpdate() bool {
+	if os.Getenv("ALGOLIA_NO_UPDATE_NOTIFIER") != "" {
+		return false
+	}
+	return !utils.IsCI() && utils.IsTerminal(os.Stdout) && utils.IsTerminal(os.Stderr)
+}
+
+func checkForUpdate(cfg *config.Config, currentVersion string) (*update.ReleaseInfo, error) {
+	if !shouldCheckForUpdate() {
+		return nil, nil
+	}
+	stateFilePath := filepath.Join(cfg.GetConfigFolder(os.Getenv("XDG_CONFIG_HOME")), "state.yml")
+	client := http.Client{}
+	return update.CheckForUpdate(&client, stateFilePath, currentVersion)
+}
+
+// Check whether the CLI was found under the Homebrew prefix
+func isUnderHomebrew(cli string) bool {
+	brewExe, err := safeexec.LookPath("brew")
+	if err != nil {
+		return false
+	}
+
+	brewPrefixBytes, err := exec.Command(brewExe, "--prefix").Output()
+	if err != nil {
+		return false
+	}
+
+	brewBinPrefix := filepath.Join(
+		strings.TrimSpace(string(brewPrefixBytes)),
+		"bin",
+	) + string(
+		filepath.Separator,
+	)
+	return strings.HasPrefix(cli, brewBinPrefix)
+}

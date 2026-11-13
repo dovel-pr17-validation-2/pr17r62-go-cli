@@ -1,0 +1,322 @@
+package telemetry
+
+import (
+	"context"
+	"crypto/md5" // nolint:gosec
+	"fmt"
+	"log"
+	"net"
+	"net/http"
+	"runtime"
+	"sync/atomic"
+
+	"github.com/segmentio/analytics-go/v3"
+	"github.com/spf13/cobra"
+	"github.com/spf13/pflag"
+	"github.com/xtgo/uuid"
+
+	"github.com/algolia/cli/pkg/utils"
+	"github.com/algolia/cli/pkg/version"
+)
+
+const (
+	AppName = "cli"
+	// No trailing slash: analytics-go appends "/v1/batch" to the endpoint.
+	telemetryAnalyticsURL = "https://telemetry-proxy.algolia.com"
+	envHeader             = "X-Algolia-CLI-Env"
+)
+
+type telemetryMetadataKey struct{}
+
+type telemetryClientKey struct{}
+
+type TelemetryClient interface {
+	Identify(ctx context.Context) error
+	Track(ctx context.Context, event string, properties map[string]any) error
+	Close()
+}
+
+type AnalyticsTelemetryClient struct {
+	client analytics.Client
+	// sequence numbers the Track events of one invocation so their order can
+	// be reconstructed downstream: Segment stores timestamps with millisecond
+	// precision, so back-to-back events can tie.
+	sequence atomic.Int64
+}
+
+type AnalyticsTelemetryLogger struct {
+	debug  bool
+	logger *log.Logger
+}
+
+func (l AnalyticsTelemetryLogger) Logf(format string, args ...interface{}) {
+	if l.debug {
+		fmt.Printf("INFO: "+format, args...)
+	}
+}
+
+func (l AnalyticsTelemetryLogger) Errorf(format string, args ...interface{}) {
+	// The telemetry should always fail silently, unless in debug mode
+	if l.debug {
+		fmt.Printf("ERROR: "+format, args...)
+	}
+}
+
+func newTelemetryLogger(debug bool) AnalyticsTelemetryLogger {
+	return AnalyticsTelemetryLogger{debug, log.New(nil, "telemetry ", log.LstdFlags)}
+}
+
+func NewAnalyticsTelemetryClient(debug bool) (TelemetryClient, error) {
+	client, err := analytics.NewWithConfig("", analytics.Config{
+		Endpoint: telemetryAnalyticsURL,
+		Logger:   newTelemetryLogger(debug),
+		Verbose:  debug,
+		Transport: &envHeaderTransport{
+			base: http.DefaultTransport,
+			env:  telemetryEnv(),
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &AnalyticsTelemetryClient{client: client}, nil
+}
+
+// envHeaderTransport adds the X-Algolia-CLI-Env header to every telemetry
+// request, so the proxy can route release builds to the production Segment
+// source and everything else to the development one. Until the proxy routes
+// on the header, all events keep going to the development source.
+type envHeaderTransport struct {
+	base http.RoundTripper
+	env  string
+}
+
+func (t *envHeaderTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	// RoundTrippers must not mutate the caller's request.
+	req = req.Clone(req.Context())
+	req.Header.Set(envHeader, t.env)
+	return t.base.RoundTrip(req)
+}
+
+// telemetryEnv reports which environment the events belong to: "prod" for
+// release builds (goreleaser injects a semver version), "dev" for source
+// builds (the version stays "main").
+func telemetryEnv() string {
+	if version.Version == "main" {
+		return "dev"
+	}
+	return "prod"
+}
+
+// anonymousID is a unique identifier for an anonymous user of the CLI (basically the hash of the mac address)
+func anonymousID() string {
+	addrs, err := net.Interfaces()
+	if err != nil {
+		return ""
+	}
+	for _, a := range addrs {
+		a.Flags &= net.FlagUp | net.FlagLoopback
+		if a.Flags == 0 {
+			continue // interface down
+		}
+		a := a.HardwareAddr.String()
+		if a != "" {
+			return fmt.Sprintf("%x", md5.Sum([]byte(a))) // nolint: gosec
+		}
+	}
+	return ""
+}
+
+type NoOpTelemetryClient struct{}
+
+type CLIAnalyticsEventMetadata struct {
+	AnonymousID              string   // the anonymous id is the hash of the mac address of the machine
+	UserID                   string   // the authenticated user's id from the OAuth token; empty when logged out
+	Email                    string   // the authenticated user's email, when available
+	Name                     string   // the authenticated user's name, when available
+	InvocationID             string   // the invocation id is unique to each context object and represents all events coming from one command
+	ConfiguredApplicationsNb int      // the number of configured applications
+	AppID                    string   // the app id with which the command was called
+	CommandPath              string   // the command path is the full path of the command
+	CommandFlags             []string // the command flags is the full list of flags passed to the command
+	CLIVersion               string   // the version of the CLI
+	OS                       string   // the OS of the system
+	CLIContext               string
+}
+
+// NewEventMetadata initializes an instance of CLIAnalyticsEventContext
+func NewEventMetadata() *CLIAnalyticsEventMetadata {
+	return &CLIAnalyticsEventMetadata{
+		AnonymousID:  anonymousID(),
+		InvocationID: uuid.NewRandom().String(),
+		CLIVersion:   version.Version,
+		OS:           runtime.GOOS,
+		CLIContext:   DetectCLIContext(),
+	}
+}
+
+// WithEventMetadata returns a new copy of context.Context with the provided CLIAnalyticsEventMetadata
+func WithEventMetadata(ctx context.Context, metadata *CLIAnalyticsEventMetadata) context.Context {
+	return context.WithValue(ctx, telemetryMetadataKey{}, metadata)
+}
+
+// GetEventMetadata returns the CLIAnalyticsEventMetadata from the provided context
+func GetEventMetadata(ctx context.Context) *CLIAnalyticsEventMetadata {
+	metadata := ctx.Value(telemetryMetadataKey{})
+	if metadata != nil {
+		return metadata.(*CLIAnalyticsEventMetadata)
+	}
+	return nil
+}
+
+// WithTelemetryClient returns a new copy of context.Context with the provided telemetryClient
+func WithTelemetryClient(ctx context.Context, client TelemetryClient) context.Context {
+	return context.WithValue(ctx, telemetryClientKey{}, client)
+}
+
+// GetTelemetryClient returns the CLIAnalyticsEventMetadata from the provided context
+func GetTelemetryClient(ctx context.Context) TelemetryClient {
+	client := ctx.Value(telemetryClientKey{})
+	if client != nil {
+		return client.(TelemetryClient)
+	}
+	return nil
+}
+
+// SetCobraCommandContext sets the telemetry values for the command being executed.
+func (e *CLIAnalyticsEventMetadata) SetCobraCommandContext(cmd *cobra.Command) {
+	e.CommandPath = cmd.CommandPath()
+	var flags []string
+	cmd.Flags().VisitAll(func(f *pflag.Flag) {
+		if f.Changed {
+			flags = append(flags, f.Name)
+		}
+	})
+	e.CommandFlags = flags
+}
+
+// SetAppID sets the AppID on the CLIAnalyticsEventContext object
+func (e *CLIAnalyticsEventMetadata) SetAppID(appID string) {
+	e.AppID = appID
+}
+
+// SetCommandPath sets the commandPath on the CLIAnalyticsEventContext object
+func (e *CLIAnalyticsEventMetadata) SetCommandPath(commandPath string) {
+	e.CommandPath = commandPath
+}
+
+// SetConfiguredApplicationsNb sets the configuredApplicationsNb on the CLIAnalyticsEventContext object
+func (e *CLIAnalyticsEventMetadata) SetConfiguredApplicationsNb(nb int) {
+	e.ConfiguredApplicationsNb = nb
+}
+
+// SetUser sets the authenticated user identity on the CLIAnalyticsEventContext object
+func (e *CLIAnalyticsEventMetadata) SetUser(userID, email, name string) {
+	e.UserID = userID
+	e.Email = email
+	e.Name = name
+}
+
+// Identify tracks the user with the provided properties
+func (a *AnalyticsTelemetryClient) Identify(ctx context.Context) error {
+	metadata := GetEventMetadata(ctx)
+
+	var isCI int8
+	if utils.IsCI() {
+		isCI = 1
+	}
+
+	traits := analytics.Traits{
+		"configured_applications": metadata.ConfiguredApplicationsNb,
+		"version":                 metadata.CLIVersion,
+		"operating_system":        metadata.OS,
+		"is_ci":                   isCI,
+	}
+
+	identify := analytics.Identify{
+		AnonymousId: metadata.AnonymousID,
+		Traits:      traits,
+		Context: &analytics.Context{
+			Device: analytics.DeviceInfo{
+				Id: metadata.AnonymousID,
+			},
+		},
+	}
+
+	if metadata.UserID != "" {
+		identify.UserId = metadata.UserID
+		if metadata.Email != "" {
+			traits["email"] = metadata.Email
+		}
+		if metadata.Name != "" {
+			traits["name"] = metadata.Name
+		}
+	}
+
+	return a.client.Enqueue(identify)
+}
+
+// Track tracks the event with the provided custom properties, merged with the
+// base properties of the invocation
+func (a *AnalyticsTelemetryClient) Track(
+	ctx context.Context,
+	event string,
+	properties map[string]any,
+) error {
+	metadata := GetEventMetadata(ctx)
+
+	var isCI int8
+	if utils.IsCI() {
+		isCI = 1
+	}
+
+	props := make(map[string]any, len(properties)+10)
+	for k, v := range properties {
+		props[k] = v
+	}
+	// Base properties are set last so custom ones can never override them.
+	props["invocation_id"] = metadata.InvocationID
+	props["app_id"] = metadata.AppID
+	props["command"] = metadata.CommandPath
+	props["flags"] = metadata.CommandFlags
+	props["sequence"] = a.sequence.Add(1)
+	props["cli_context"] = metadata.CLIContext
+	props["version"] = metadata.CLIVersion
+	props["operating_system"] = metadata.OS
+	props["configured_applications"] = metadata.ConfiguredApplicationsNb
+	props["is_ci"] = isCI
+
+	track := analytics.Track{
+		Event:       event,
+		AnonymousId: metadata.AnonymousID,
+		Properties:  props,
+		Context: &analytics.Context{
+			Device: analytics.DeviceInfo{
+				Id: metadata.AnonymousID,
+			},
+		},
+	}
+
+	if metadata.UserID != "" {
+		track.UserId = metadata.UserID
+	}
+
+	return a.client.Enqueue(track)
+}
+
+// Close closes the client, waiting for all pending events to be sent.
+func (a *AnalyticsTelemetryClient) Close() {
+	_ = a.client.Close()
+}
+
+func (a *NoOpTelemetryClient) Identify(ctx context.Context) error { return nil }
+
+func (a *NoOpTelemetryClient) Track(
+	ctx context.Context,
+	event string,
+	properties map[string]any,
+) error {
+	return nil
+}
+
+func (a *NoOpTelemetryClient) Close() {}

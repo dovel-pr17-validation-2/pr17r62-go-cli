@@ -1,0 +1,250 @@
+package clear
+
+import (
+	"encoding/json"
+	"fmt"
+	"testing"
+
+	"github.com/algolia/algoliasearch-client-go/v4/algolia/search"
+	"github.com/google/shlex"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/algolia/cli/pkg/cmdutil"
+	"github.com/algolia/cli/pkg/httpmock"
+	"github.com/algolia/cli/pkg/iostreams"
+	"github.com/algolia/cli/test"
+)
+
+func TestNewClearCmd(t *testing.T) {
+	tests := []struct {
+		name      string
+		tty       bool
+		cli       string
+		wantsErr  bool
+		wantsOpts ClearOptions
+	}{
+		{
+			name:     "no --confirm without tty",
+			cli:      "plurals",
+			tty:      false,
+			wantsErr: true,
+			wantsOpts: ClearOptions{
+				DoConfirm: true,
+				Dictionaries: []search.DictionaryType{
+					search.DICTIONARY_TYPE_PLURALS,
+				},
+			},
+		},
+		{
+			name:     "--confirm without tty",
+			cli:      "plurals --confirm",
+			tty:      false,
+			wantsErr: false,
+			wantsOpts: ClearOptions{
+				DoConfirm: false,
+				Dictionaries: []search.DictionaryType{
+					search.DICTIONARY_TYPE_PLURALS,
+				},
+			},
+		},
+		{
+			name:     "with only --all",
+			cli:      "--all",
+			tty:      true,
+			wantsErr: false,
+			wantsOpts: ClearOptions{
+				DoConfirm:    true,
+				Dictionaries: search.AllowedDictionaryTypeEnumValues,
+			},
+		},
+		{
+			name:     "with args and --all",
+			cli:      "plurals --all --confirm",
+			tty:      false,
+			wantsErr: true,
+			wantsOpts: ClearOptions{
+				DoConfirm: false,
+				Dictionaries: []search.DictionaryType{
+					search.DICTIONARY_TYPE_PLURALS,
+				},
+			},
+		},
+		{
+			name:     "wrong dictionary name",
+			cli:      "foo --confirm",
+			tty:      false,
+			wantsErr: true,
+			wantsOpts: ClearOptions{
+				DoConfirm: false,
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			io, _, stdout, stderr := iostreams.Test()
+			if tt.tty {
+				io.SetStdinTTY(tt.tty)
+				io.SetStdoutTTY(tt.tty)
+			}
+
+			f := &cmdutil.Factory{
+				IOStreams: io,
+			}
+
+			var opts *ClearOptions
+			cmd := NewClearCmd(f, func(o *ClearOptions) error {
+				opts = o
+				return nil
+			})
+
+			args, err := shlex.Split(tt.cli)
+			require.NoError(t, err)
+			cmd.SetArgs(args)
+			_, err = cmd.ExecuteC()
+			if tt.wantsErr {
+				assert.Error(t, err)
+				return
+			} else {
+				require.NoError(t, err)
+			}
+
+			assert.Equal(t, "", stdout.String())
+			assert.Equal(t, "", stderr.String())
+
+			assert.Equal(t, tt.wantsOpts.Dictionaries, opts.Dictionaries)
+			assert.Equal(t, tt.wantsOpts.DoConfirm, opts.DoConfirm)
+		})
+	}
+}
+
+func Test_runDeleteCmd(t *testing.T) {
+	tests := []struct {
+		name         string
+		cli          string
+		dictionaries []search.DictionaryType
+		entries      bool
+		isTTY        bool
+		wantOut      string
+	}{
+		{
+			name: "one dictionary",
+			cli:  "plurals --confirm",
+			dictionaries: []search.DictionaryType{
+				search.DICTIONARY_TYPE_PLURALS,
+			},
+			entries: true,
+			isTTY:   false,
+			wantOut: "",
+		},
+		{
+			name: "multiple dictionaries",
+			cli:  "plurals compounds --confirm",
+			dictionaries: []search.DictionaryType{
+				search.DICTIONARY_TYPE_PLURALS,
+				search.DICTIONARY_TYPE_COMPOUNDS,
+			},
+			entries: true,
+			isTTY:   false,
+			wantOut: "",
+		},
+		{
+			name:         "all dictionaries",
+			cli:          "--all --confirm",
+			dictionaries: search.AllowedDictionaryTypeEnumValues,
+			entries:      true,
+			isTTY:        false,
+			wantOut:      "",
+		},
+		{
+			name: "no entries",
+			cli:  "plurals --confirm",
+			dictionaries: []search.DictionaryType{
+				search.DICTIONARY_TYPE_PLURALS,
+			},
+			entries: false,
+			isTTY:   false,
+			wantOut: "! No entries to clear in plurals dictionary.\n",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := httpmock.Registry{}
+			for _, d := range tt.dictionaries {
+				var entries []search.DictionaryEntry
+				if tt.entries {
+					entries = append(
+						entries,
+						search.DictionaryEntry{
+							ObjectID: "1",
+							Language: search.SUPPORTED_LANGUAGE_EN.Ptr(),
+							Words:    []string{"foo", "bar"},
+							Type:     search.DICTIONARY_ENTRY_TYPE_CUSTOM.Ptr(),
+						},
+					)
+				}
+				r.Register(
+					httpmock.REST("POST", fmt.Sprintf("1/dictionaries/%s/search", d)),
+					httpmock.JSONResponse(search.SearchDictionaryEntriesResponse{
+						Hits: entries,
+					}),
+				)
+				r.Register(
+					httpmock.REST("POST", fmt.Sprintf("1/dictionaries/%s/batch", d)),
+					httpmock.JSONResponse(search.UpdatedAtResponse{}),
+				)
+			}
+
+			f, out := test.NewFactory(tt.isTTY, &r, nil, "")
+			cmd := NewClearCmd(f, nil)
+			out, err := test.Execute(cmd, tt.cli, out)
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			assert.Equal(t, tt.wantOut, out.String())
+		})
+	}
+}
+
+// Test_runClearCmd_outputJSON checks that the --output json path emits one
+// response per cleared dictionary, in order — i.e. the collection loop.
+func Test_runClearCmd_outputJSON(t *testing.T) {
+	r := httpmock.Registry{}
+	dicts := []search.DictionaryType{
+		search.DICTIONARY_TYPE_PLURALS,
+		search.DICTIONARY_TYPE_COMPOUNDS,
+	}
+	for i, d := range dicts {
+		r.Register(
+			httpmock.REST("POST", fmt.Sprintf("1/dictionaries/%s/search", d)),
+			httpmock.JSONResponse(search.SearchDictionaryEntriesResponse{
+				Hits: []search.DictionaryEntry{
+					{
+						ObjectID: "1",
+						Language: search.SUPPORTED_LANGUAGE_EN.Ptr(),
+						Words:    []string{"foo"},
+						Type:     search.DICTIONARY_ENTRY_TYPE_CUSTOM.Ptr(),
+					},
+				},
+			}),
+		)
+		r.Register(
+			httpmock.REST("POST", fmt.Sprintf("1/dictionaries/%s/batch", d)),
+			httpmock.JSONResponse(search.UpdatedAtResponse{TaskID: int64((i + 1) * 100)}),
+		)
+	}
+
+	f, out := test.NewFactory(false, &r, nil, "")
+	cmd := NewClearCmd(f, nil)
+	out, err := test.Execute(cmd, "plurals compounds --confirm --output json", out)
+	require.NoError(t, err)
+
+	var got []search.UpdatedAtResponse
+	require.NoError(t, json.Unmarshal([]byte(out.String()), &got))
+	assert.Len(t, got, 2)
+	assert.Equal(t, int64(100), got[0].TaskID)
+	assert.Equal(t, int64(200), got[1].TaskID)
+}
